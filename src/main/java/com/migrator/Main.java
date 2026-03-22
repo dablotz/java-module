@@ -1,147 +1,111 @@
 package com.migrator;
 
-import com.migrator.io.FileCollector;
-import com.migrator.logging.MigrationLogger;
-import com.migrator.model.MigrationResult;
-import com.migrator.pipeline.Pipeline;
-import com.migrator.pipeline.PipelineBuilder;
-import com.migrator.reduce.DeduplicationReducer;
-import com.migrator.reduce.LastWriteWinsReducer;
+import com.migrator.server.JobRecord;
+import com.migrator.server.JobStatus;
+import com.migrator.server.JobStore;
+import com.migrator.server.MetricsStore;
+import com.migrator.server.MigrationJobRunner;
+import io.javalin.Javalin;
+import io.javalin.http.UploadedFile;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.UUID;
 
 /**
- * CLI entry point.
- *
- * <pre>
- *   java -jar migrator.jar --input dir/region_a.csv dir/region_b.csv --output result.json
- * </pre>
- *
- * Optional flags (append after {@code --output}):
- * <ul>
- *   <li>{@code --strategy dedup} — use first-seen wins instead of last-write wins</li>
- *   <li>{@code --key <field>}    — key field for deduplication (default: {@code id})</li>
- * </ul>
+ * HTTP server entry point. Starts a Javalin server on port 7000 and registers
+ * four endpoints: POST /migrate, GET /jobs/{jobId}, GET /metrics, GET /health.
  */
 public class Main {
 
-    private static final MigrationLogger LOG = new MigrationLogger(Main.class);
+    private static final int PORT = 7000;
 
     public static void main(String[] args) {
-        if (args.length == 0) {
-            printUsage();
-            System.exit(1);
-        }
+        JobStore           jobStore     = new JobStore();
+        MetricsStore       metricsStore = new MetricsStore();
+        MigrationJobRunner runner       = new MigrationJobRunner(jobStore, metricsStore);
 
-        List<String> inputPaths = new ArrayList<>();
-        String outputPath = null;
-        String strategy = "last-write-wins";
-        String keyField = "id";
+        Javalin app = Javalin.create().start(PORT);
 
-        int i = 0;
-        while (i < args.length) {
-            switch (args[i]) {
-                case "--input" -> {
-                    i++;
-                    while (i < args.length && !args[i].startsWith("--")) {
-                        inputPaths.add(args[i++]);
-                    }
-                }
-                case "--output" -> {
-                    if (i + 1 >= args.length) {
-                        System.err.println("Error: --output requires a file path");
-                        printUsage();
-                        System.exit(1);
-                    }
-                    outputPath = args[++i];
-                    i++;
-                }
-                case "--strategy" -> {
-                    if (i + 1 >= args.length) {
-                        System.err.println("Error: --strategy requires a value (dedup|last-write-wins)");
-                        printUsage();
-                        System.exit(1);
-                    }
-                    strategy = args[++i];
-                    i++;
-                }
-                case "--key" -> {
-                    if (i + 1 >= args.length) {
-                        System.err.println("Error: --key requires a field name");
-                        printUsage();
-                        System.exit(1);
-                    }
-                    keyField = args[++i];
-                    i++;
-                }
-                default -> {
-                    System.err.println("Error: unknown argument '" + args[i] + "'");
-                    printUsage();
-                    System.exit(1);
-                }
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            app.stop();
+            runner.shutdown();
+        }));
+
+        // ── POST /migrate ─────────────────────────────────────────────────────
+        app.post("/migrate", ctx -> {
+            List<UploadedFile> uploads = ctx.uploadedFiles("files");
+            if (uploads.isEmpty()) {
+                ctx.status(400).json(Map.of("error",
+                        "At least one CSV file must be uploaded under the 'files' field"));
+                return;
             }
-        }
 
-        if (inputPaths.isEmpty()) {
-            System.err.println("Error: --input requires at least one file path");
-            printUsage();
-            System.exit(1);
-        }
-        if (outputPath == null) {
-            System.err.println("Error: --output is required");
-            printUsage();
-            System.exit(1);
-        }
+            String jobId = UUID.randomUUID().toString();
+            String rawOutputName = ctx.formParam("outputFileName");
+            String outputFileName = (rawOutputName != null && !rawOutputName.isBlank())
+                    ? rawOutputName
+                    : jobId + ".json";
 
-        FileCollector collector = new FileCollector();
-        List<Path> validInputs = collector.collect(inputPaths);
-        if (validInputs.isEmpty()) {
-            System.err.println("Error: none of the supplied input files could be read");
-            System.exit(1);
-        }
+            // Write uploaded files to a per-job temp input directory
+            Path inputDir = Files.createTempDirectory("migrator-" + jobId + "-in");
+            List<Path> inputPaths = new ArrayList<>(uploads.size());
+            for (UploadedFile upload : uploads) {
+                Path dest = inputDir.resolve(upload.filename());
+                try (InputStream in = upload.content()) {
+                    Files.copy(in, dest, StandardCopyOption.REPLACE_EXISTING);
+                }
+                inputPaths.add(dest);
+            }
 
-        try {
-            Pipeline pipeline = new PipelineBuilder()
-                    .inputFiles(validInputs)
-                    .outputFile(Path.of(outputPath))
-                    .keyField(keyField)
-                    .requiredFields(List.of(keyField))
-                    .fieldRemappings(Map.of("cust_nm", "customerName"))
-                    .titleCaseFields(Set.of("customerName", "name", "fullName"))
-                    .reducer("dedup".equalsIgnoreCase(strategy)
-                            ? new DeduplicationReducer()
-                            : new LastWriteWinsReducer())
-                    .build();
+            // Separate per-job output directory — not deleted after the job finishes
+            Path outputDir = Files.createTempDirectory("migrator-" + jobId + "-out");
 
-            MigrationResult result = pipeline.execute();
+            JobRecord job = new JobRecord(jobId);
+            jobStore.register(job);
+            metricsStore.recordSubmission();
+            runner.submit(job, inputPaths, outputDir, outputFileName);
 
-            LOG.info("Migration complete — read={}, accepted={}, rejected={}",
-                    result.getTotalRecordsRead(),
-                    result.getTotalRecordsAccepted(),
-                    result.getTotalRecordsRejected());
+            ctx.status(202).json(Map.of("jobId", jobId, "status", "PENDING"));
+        });
 
-        } catch (Exception e) {
-            LOG.error("Fatal error during migration", e);
-            System.err.println("Fatal error: " + e.getMessage());
-            System.exit(2);
-        }
-    }
+        // ── GET /jobs/{jobId} ─────────────────────────────────────────────────
+        app.get("/jobs/{jobId}", ctx -> {
+            String jobId = ctx.pathParam("jobId");
+            jobStore.get(jobId).ifPresentOrElse(job -> {
+                JobStatus status = job.status; // single volatile read
+                switch (status) {
+                    case COMPLETE -> ctx.json(Map.of(
+                            "jobId",                job.jobId,
+                            "status",               status.name(),
+                            "totalRecordsRead",     job.totalRecordsRead,
+                            "totalRecordsAccepted", job.totalRecordsAccepted,
+                            "totalRecordsRejected", job.totalRecordsRejected,
+                            "outputFile",           job.outputFile
+                    ));
+                    case FAILED -> ctx.json(Map.of(
+                            "jobId",        job.jobId,
+                            "status",       status.name(),
+                            "errorMessage", job.errorMessage
+                    ));
+                    default -> ctx.json(Map.of(
+                            "jobId",  job.jobId,
+                            "status", status.name()
+                    ));
+                }
+            }, () -> ctx.status(404).json(Map.of("error", "Job not found: " + jobId)));
+        });
 
-    private static void printUsage() {
-        System.err.println("""
-                Usage:
-                  java -jar migrator.jar --input <file1> [file2 ...] --output <output.json> [options]
+        // ── GET /metrics ──────────────────────────────────────────────────────
+        app.get("/metrics", ctx -> ctx.json(metricsStore.snapshot()));
 
-                Options:
-                  --key <field>          Key field for deduplication (default: id)
-                  --strategy <name>      Conflict strategy: last-write-wins (default) | dedup
-
-                Example:
-                  java -jar migrator.jar --input region_a.csv region_b.csv --output result.json
-                """);
+        // ── GET /health ───────────────────────────────────────────────────────
+        app.get("/health", ctx -> ctx.json(Map.of("status", "UP")));
     }
 }
