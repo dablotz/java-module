@@ -1,0 +1,6 @@
+id,cust_nm,orderTotal,status
+ORD-001,  jane smith  ,199.99,active
+ORD-002,john doe,50.00,active
+ORD-003,  ,75.00,active
+ORD-004,alice johnson,320.00,inactive
+ORD-005,bob williams,15.50,active

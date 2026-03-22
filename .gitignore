@@ -1,0 +1,27 @@
+# Maven
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+release.properties
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+.factorypath
+
+# Logs
+*.log
+migration.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output artifacts
+data/result*.json
+data/*_rejected.csv

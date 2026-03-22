@@ -1,0 +1,6 @@
+id,cust_nm,orderTotal,status
+ORD-001,JANE SMITH,249.99,active
+ORD-006,carol white,88.00,active
+ORD-007,dave brown,430.75,inactive
+,orphan record,10.00,active
+ORD-008,eve davis,62.30,active
